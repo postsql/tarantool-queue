@@ -1,0 +1,336 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="chrome=1">
+    <title>Tarantool-queue by mailru</title>
+
+    <link rel="stylesheet" href="stylesheets/styles.css">
+    <link rel="stylesheet" href="stylesheets/pygment_trac.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <!--[if lt IE 9]>
+    <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+  </head>
+  <body>
+    <div class="wrapper">
+      <header>
+        <h1>Tarantool-queue</h1>
+        <p>A set of Lua stored procedures for making a queue server out of Tarantool</p>
+
+        <p class="view"><a href="https://github.com/mailru/tarantool-queue">View the Project on GitHub <small>mailru/tarantool-queue</small></a></p>
+
+
+        <ul>
+          <li><a href="https://github.com/mailru/tarantool-queue/zipball/master">Download <strong>ZIP File</strong></a></li>
+          <li><a href="https://github.com/mailru/tarantool-queue/tarball/master">Download <strong>TAR Ball</strong></a></li>
+          <li><a href="https://github.com/mailru/tarantool-queue">View On <strong>GitHub</strong></a></li>
+        </ul>
+      </header>
+      <section>
+        <h1>Queue API description</h1>
+
+<p>A Tarantool/Box instance can serve as a Queue Manager, along
+with any other database work necessary.</p>
+
+<p>A single properly configured Tarantool/Box space can store any
+number of queues. Multiple spaces can be used as well - for
+partitioning or logical separation of queues.</p>
+
+<p>Queues support task priority. Priority value lays in the range
+[0, 255], with default value being 127. A higher value means higher
+priority, lower value - lower priority.</p>
+
+<p>Each queue has one (currently) associated <em>fiber</em> taking care of
+it. The fiber is started upon first access to the queue. The job
+of the fiber is to monitor orphaned tasks, as well as prune and
+clean the queue from obsolete tasks.</p>
+
+<p>To configure a space supporting queues, use the following parameters:</p>
+
+<div class="highlight"><pre><span class="na">space</span> <span class="o">=</span> <span class="s">[</span>
+<span class="s">    {</span>
+<span class="s">        enabled = 1,</span>
+<span class="s">        index = [</span>
+<span class="s">            {</span>
+<span class="s">                type = "TREE",</span>
+<span class="s">                unique = 1,</span>
+<span class="s">                key_field = [</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 0,</span>
+<span class="s">                        type = "STR"</span>
+<span class="s">                    }</span>
+<span class="s">                ]</span>
+<span class="s">            },</span>
+<span class="s">            {</span>
+<span class="s">                type = "TREE",</span>
+<span class="s">                unique = 0,</span>
+<span class="s">                key_field = [</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 1,    # queue, aka tube</span>
+<span class="s">                        type = "STR"</span>
+<span class="s">                    },</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 2,    # status</span>
+<span class="s">                        type = "STR"</span>
+<span class="s">                    },</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 4,    # ipri</span>
+<span class="s">                        type = "STR"</span>
+<span class="s">                    },</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 5    # pri</span>
+<span class="s">                        type = "STR"</span>
+<span class="s">                    }</span>
+<span class="s">                ]</span>
+<span class="s">            },</span>
+<span class="s">            {</span>
+<span class="s">                type    = "TREE",</span>
+<span class="s">                unique  = 0,</span>
+<span class="s">                key_field = [</span>
+<span class="s">                    {</span>
+<span class="s">                        fieldno = 3,    # next_event</span>
+<span class="s">                        type = "NUM64"</span>
+<span class="s">                    }</span>
+<span class="s">                ]</span>
+<span class="s">            }</span>
+<span class="s">        ]</span>
+<span class="s">    }</span>
+<span class="err">]</span>
+</pre></div>
+
+<p>It may also be desirable to tune server <code>readahead</code> configuration
+variable if many consumers re-use the same socket for getting and
+acknowledging tasks.</p>
+
+<p>The recommended value can be calculated as:</p>
+
+<pre><code>  consumers-per-socket * (256 + largest task size)
+</code></pre>
+
+<p>For example, if the largest task size is 256 bytes, and average
+number of consumers per socket is 10, the recommended <code>readahead</code>
+value must be at least 51 200 bytes.</p>
+
+<h2>Terminology</h2>
+
+<ul>
+<li>
+<em>Consumer</em> - a process, taking and executing tasks</li>
+<li>
+<em>Producer</em> - a process adding new tasks</li>
+</ul><h3>Arguments of queue API functions</h3>
+
+<ul>
+<li>
+<code>space</code> (number) space id. To avoid confusion and broken statistics,
+it's necessary to consistently use numbers to identify spaces,</li>
+<li>
+<code>tube</code> (string) - queue name,</li>
+<li>
+<code>delay</code> (number) - a delay between the moment a task is queued
+and is executed, in seconds</li>
+<li>
+<code>ttl</code> (number) - task time to live, in seconds. If <code>delay</code> is
+given along with <code>ttl</code>, the effective task time to live is
+increased by the amount of <code>delay</code>,</li>
+<li>
+<code>ttr</code> (number) - task time to run, the maximal time allotted
+to a consumer to execute a task, in seconds,</li>
+<li>
+<code>pri</code> (number) - task priority [0..255],</li>
+<li>
+<code>id</code> (string) - task id,</li>
+<li>
+<code>timeout</code> (number) - timeout in seconds for the Queue API function.</li>
+</ul><h3>Task states</h3>
+
+<ul>
+<li>
+<code>ready</code> - a task is ready for execution,</li>
+<li>
+<code>delayed</code> - a task is awaiting task <code>delay</code> to expire, after
+which it will become <code>ready</code>,</li>
+<li>
+<code>taken</code> - a task is taken by a consumer and is being executed,</li>
+<li>
+<code>done</code> - a task is complete (but not deleted, since the consumer
+called <code>done</code> rather than <code>ack</code>),</li>
+<li>
+<code>buried</code> - a task is neither ready nor taken nor complete, it's
+excluded (perhaps temporarily) from the list of tasks for
+execution, but not deleted.</li>
+</ul><h3>The format of task tuple</h3>
+
+<p>Queue API functions, such as <code>put</code>, <code>take</code>, return a task.
+The task consists of the following fields:</p>
+
+<ol>
+<li>
+<code>id</code> (string) - task identifier</li>
+<li>
+<code>tube</code> (string) - queue identifier</li>
+<li>
+<code>status</code> (string) - task status</li>
+<li>task data (all fields passed into <code>put</code>/<code>urgent</code> when
+the task was created)</li>
+</ol><h2>API</h2>
+
+<h3>Producer</h3>
+
+<h4>queue.put(space, tube, delay, ttl, ttr, pri, ...)</h4>
+
+<p>Enqueue a task. Returns a tuple, representing the new task.
+The list of fields with task data is optional.</p>
+
+<h4>queue.urgent(space, tube, delay, ttl, ttr, pri, ...)</h4>
+
+<p>Enqueue a task. The task will get the highest priority.
+If <code>delay</code> is not zero, the function is equivalent to <code>put</code>.</p>
+
+<h3>Consumer</h3>
+
+<h4>queue.take(space, tube, timeout)</h4>
+
+<p>If there are tasks in the queue <code>ready</code> for execution,
+take the highest-priority task.
+Otherwise, wait for a <code>ready</code> task to appear in the queue, and, as
+soon as it appears, mark it as <code>taken</code> and return to the consumer.
+If there is a <code>timeout</code>, and the task doesn't appear until the
+timeout expires, returns nil. If timeout is not given, waits
+indefinitely.</p>
+
+<p>All the time while the consumer is working on a task, it must keep
+the connection to the server open. If a connection disappears while
+the consumer is still working on a task, the task is put back on the
+<code>ready</code> list.</p>
+
+<h4>queue.ack(space, id)</h4>
+
+<p>Confirm completion of a task. Before marking a task as complete,
+this function verifies that:</p>
+
+<ul>
+<li>the task is <code>taken</code> and</li>
+<li>the consumer that is confirming the task is the one which took it</li>
+</ul><p>Consumer identity is established using a session identifier. In
+other words, the task must be confirmed by the same connection
+which took it. If verification fails, the function returns an
+error.</p>
+
+<p>On success, deletes the task from the queue.</p>
+
+<h4>queue.release(space, id [, delay [, ttl ] ])</h4>
+
+<p>Return a task back to the queue: the task is not executed.
+Additionally, a new time to live and re-execution delay can be
+provided.</p>
+
+<h4>queue.requeue(space, id)</h4>
+
+<p>Return a task to the queue, the task is not executed. Puts
+the task at the end of the queue, so that it's executed only
+after all existing tasks in the queue are executed.</p>
+
+<h4>queue.bury(space, id)</h4>
+
+<p>Mark a task as <code>buried</code>. This special status excludes
+the task from the active list, until it's <code>dug up</code>.
+This function is useful when several attempts to execute a task
+lead to a failure. Buried tasks can be monitored by the queue
+owner, and treated specially.</p>
+
+<h4>queue.done(space, id, ...)</h4>
+
+<p>Mark a task as complete (<code>done</code>), but doesn't delete it.
+Replaces task data with the supplied fields.</p>
+
+<h3>Common functions (neither producer nor consumer).</h3>
+
+<h4>queue.dig(space, id)</h4>
+
+<p>'Dig up' a buried task. Checks, that the task is buried.
+The task status is changed to <code>ready</code>.</p>
+
+<h4>queue.kick(space, tube [, count] )</h4>
+
+<p>'Dig up' <code>count</code> tasks in a queue. If <code>count</code> is not given,
+digs up just one buried task.</p>
+
+<h4>queue.unbury(space, id)</h4>
+
+<p>An alias to <code>dig</code>.</p>
+
+<h4>queue.delete(space, id)</h4>
+
+<p>Delete a task from the queue (regardless of task state or status).</p>
+
+<h4>queue.meta(space, id)</h4>
+
+<p>Return taks metadata:</p>
+
+<ol>
+<li>
+<code>id</code> (string) - task id</li>
+<li>
+<code>tube</code> (string) - queue id</li>
+<li>
+<code>status</code> (string) - task status</li>
+<li>
+<code>event</code> (time64) - time of the next important event in task
+life time, for example, when <code>ttl</code> or <code>ttr</code> expires, in seconds
+since start of the UNIX epoch</li>
+<li>
+<code>ipri</code> (string) - internal value of the task priority</li>
+<li>
+<code>pri</code> (string) - task priority as set when the task was added
+to the queue</li>
+<li>
+<code>cid</code> (number) - consumer id, of the consumer which took the
+task (only if the task is <code>taken</code>)</li>
+<li>
+<code>created</code> (time64) - time when the task was created (seconds
+since start of the UNIX epoch).</li>
+<li>
+<code>ttl</code> (time64) - task time to live</li>
+<li>
+<code>ttr</code> (time64) - task time to run</li>
+<li>
+<code>cbury</code> (count) - how many times the task was buried</li>
+<li>
+<code>ctaken</code> (Ч) - how many times the task was taken</li>
+<li>
+<code>now</code> (time64) - time recorded when the meta was called</li>
+</ol><h4>queue.peek(space, id)</h4>
+
+<p>Return a task by task id. Returned tuple has the following
+fields:</p>
+
+<ol>
+<li>
+<code>id</code> (string) - task identifier</li>
+<li>
+<code>tube</code> (string) - queue identifier</li>
+<li>
+<code>status</code> (string) - task status</li>
+<li>task data (all fields passed into <code>put</code>/<code>urgent</code> when
+the task was created)</li>
+</ol><h4>queue.statistics()</h4>
+
+<p>Return queue module statistics, since server start.
+The statistics is broken down by queue id. Only queues on which
+there was some activity are included in the output.</p>
+
+<p>The format of the statistics is a sequence of rows, where each
+odd row is the name of a statistical parameter, and the
+next even row is its value.</p>
+      </section>
+      <footer>
+        <p>This project is maintained by <a href="https://github.com/mailru">mailru</a></p>
+        <p><small>Hosted on GitHub Pages &mdash; Theme by <a href="https://github.com/orderedlist">orderedlist</a></small></p>
+      </footer>
+    </div>
+    <script src="javascripts/scale.fix.js"></script>
+    
+  </body>
+</html>
